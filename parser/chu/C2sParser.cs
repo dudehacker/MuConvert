@@ -12,7 +12,7 @@ namespace MuConvert.chu;
  * C2S 格式解析器（官方格式，RESOLUTION=384 tick/小节）。
  * Tab 分隔文本，识别 HEADER / TIMING / NOTES 区段。
  */
-public class C2sParser: BaseChuParser
+public class C2sParser : BaseChuParser
 {
     private int RSL = 384;
     private static readonly HashSet<string> HeadTags = new(StringComparer.OrdinalIgnoreCase)
@@ -20,7 +20,7 @@ public class C2sParser: BaseChuParser
     private static readonly HashSet<string> TimingTags = new(StringComparer.OrdinalIgnoreCase)
         { "BPM", "MET", "SFL", "SLP" };
 
-    private bool _used;
+    private int _version;
     // C2S 会原始记录 targetNote 字符串；用于在 FillAllPrevious 推断有多个候选时优先匹配。
     private readonly Dictionary<ChuNote, string> _rawTargetNote = new();
     private readonly Dictionary<(Rational Time, int Cell, int Width), List<(Rational, int)>> _slaRecords = new();
@@ -28,8 +28,7 @@ public class C2sParser: BaseChuParser
 
     public override (ChuChart, List<Alert>) Parse(string text)
     {
-        if (_used) throw new Exception(Locale.InstanceMultipleUsage);
-        _used = true;
+        if (_version > 0) throw new Exception(Locale.InstanceMultipleUsage);
         var chart = new ChuChart();
         var alerts = new List<Alert>();
         var lines = text.Replace("\r\n", "\n").Split('\n');
@@ -81,6 +80,10 @@ public class C2sParser: BaseChuParser
         var tag = p[0].ToUpperInvariant();
         switch (tag)
         {
+            case "VERSION":
+                var segs = p[1].Split('.').Select(int.Parse).ToArray();
+                _version = segs[0] * 100 + segs[1];
+                break;
             case "MUSIC": chart.MusicId = Int(p, 1).ToString(); break;
             case "DIFFICULT": chart.Difficulty = Int(p, 1); break;
             case "LEVEL": chart.Level = Decimal(p, 1); break;
@@ -95,7 +98,7 @@ public class C2sParser: BaseChuParser
         switch (tag)
         {
             case "BPM":
-                chart.BpmList.Add(new BPM(Int(p, 1) + new Rational(Int(p, 2), RSL), 
+                chart.BpmList.Add(new BPM(Int(p, 1) + new Rational(Int(p, 2), RSL),
                     decimal.Parse(p[3], CultureInfo.InvariantCulture)));
                 break;
             case "MET":
@@ -127,11 +130,11 @@ public class C2sParser: BaseChuParser
         seg.Length = new Rational(Int(p, durationIdx), RSL);
         if (note.Type is ChuNoteType.Slide or ChuNoteType.Crush)
         {
-            seg.EndCell = Int(p, durationIdx + 1); 
-            seg.EndWidth = Math.Max(1, Int(p, durationIdx + 2, 1));
+            seg.EndCell = Int(p, durationIdx + 1);
+            seg.EndWidth = Math.Max(1, Int(p, durationIdx + 2, note.EndWidth));
             if (note.IsAir) seg.EndHeight = Decimal(p, durationIdx + 3, 5);
         }
-        
+
         return seg;
     }
 
@@ -141,7 +144,8 @@ public class C2sParser: BaseChuParser
         ChuNote? note = new ChuNote
         {
             Time = Int(p, 1) + new Rational(Int(p, 2), RSL),
-            Cell = Int(p, 3), Width = Math.Max(1, Int(p, 4, 1)),
+            Cell = Int(p, 3),
+            Width = Math.Max(1, Int(p, 4, 1)),
         };
 
         if (type == "SLA")
@@ -151,7 +155,7 @@ public class C2sParser: BaseChuParser
             _slaRecords.Add((note.Time, note.Cell, note.Width), (length, groupId));
             return;
         }
-        
+
         var t = type switch
         {
             "TAP" or "CHR" => (ChuNoteType.Tap, false),
@@ -167,16 +171,22 @@ public class C2sParser: BaseChuParser
         };
         if (t == null) return;
         (note.Type, note.IsAir) = t.Value;
-        
+
         string? targetNote = null;
         if (note.Type is ChuNoteType.Tap or ChuNoteType.Mine or ChuNoteType.Flick)
         {
-            if (type == "CHR") ParseEnum<ExDirection>(Str(p, 5), x=>note.Ex = x);
+            if (type == "CHR")
+            {
+                note.Ex = ExDirection.UP; // default value when CHR direction parsing failed
+                var direction = Str(p, 5);
+                if (!(string.IsNullOrEmpty(direction) && _version < 108))
+                    ParseEnum<ExDirection>(direction, x => note.Ex = x);
+            }
             else if (note is { Type: ChuNoteType.Tap, IsAir: true })
             {
-                ParseEnum<AirDirection>(type, x=>note.AirDirection = x);
+                ParseEnum<AirDirection>(type, x => note.AirDirection = x);
                 targetNote = Str(p, 5);
-                if (p.Length >= 7) ParseEnum<NoteColor>(Str(p, 6), x=>note.Color = x);
+                if (p.Length >= 7) ParseEnum<NoteColor>(Str(p, 6), x => note.Color = x);
             }
         }
         else
@@ -186,10 +196,13 @@ public class C2sParser: BaseChuParser
             if (ChuUtils.ShouldHaveHeight(note)) note.Height = Decimal(p, 6, 5);
             if (note.Type == ChuNoteType.Crush) note.CrushInterval = CrushInterval(p, 5);
             if (note.IsAir) // 解析颜色
-                ParseEnum<NoteColor>(Str(p, note.Type == ChuNoteType.Hold ? 7 : 11), x=>note.Color = x);
+            {
+                var color = Str(p, note.Type == ChuNoteType.Hold ? 7 : 11);
+                if (!string.IsNullOrEmpty(color)) ParseEnum<NoteColor>(color, x => note.Color = x);
+            }
             if (type is "HXD" or "SXD" or "SXC") // 解析Ex
-                ParseEnum<ExDirection>(Str(p, type == "HXD" ? 6 : 9), x=>note.Ex = x);
-            
+                ParseEnum<ExDirection>(Str(p, type == "HXD" ? 6 : 9), x => note.Ex = x);
+
             // 首先，对Air Hold/Air Slide，需要读取TargetNote，确定它是否是接续段；其他类型的音符，则默认允许是接续段
             bool canConnect = true, isConnect = false;
             if (note is { IsAir: true, Type: ChuNoteType.Hold or ChuNoteType.Slide })
